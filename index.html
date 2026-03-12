@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tier2 CRM v.6.5.2 (Path Fixed)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+
+    <script type="module">
+        // 🔑 สำคัญมาก: เช็กว่าไฟล์ config.js อยู่ในโฟลเดอร์เดียวกับไฟล์นี้
+        import { firebaseConfig } from './config.js'; 
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+        import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, deleteDoc, query, orderBy, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        let state = { config: { partners: ["ไม่ระบุ", "3+", "AIS", "TRUE", "OTHER"], devices: ["ไม่ระบุ", "iOS", "Android", "3+ Website", "tvOS", "AndroidTV", "SamsungTV", "VIDAA", "LGTV"], billing: ["ไม่ระบุ", "2C2P", "PlayStore", "AppStore", "AIS Direct", "Credit Card"], products: ["ไม่ระบุ", "Subscribe (Monthly)", "Subscribe (Yearly)", "Ticket", "Package VIP", "Point"], statuses: ["Resolve Success", "Pending", "In Progress", "Failed"], caseTypes: [] }, data: [] };
+        let filteredData = [], reportData = [], chartInstance = null, editingId = null, currentPage = 1;
+        const ROWS_PER_PAGE = 50;
+
+        function standardizeType(text) {
+            if (!text || !text.includes(':')) return text;
+            return text.split(':').map(part => part.trim()).join(' : ');
+        }
+
+        async function fetchFromCloud() {
+            try {
+                const configSnap = await getDoc(doc(db, "settings", "config"));
+                if (configSnap.exists()) {
+                    let raw = configSnap.data().caseTypes || [];
+                    state.config.caseTypes = [...new Set(raw.filter(t => t.includes(':')).map(t => standardizeType(t)))].sort();
+                }
+                const qSnapshot = await getDocs(query(collection(db, "cases")));
+                state.data = [];
+                qSnapshot.forEach((d) => {
+                    let c = d.data();
+                    if(c.type) c.type = standardizeType(c.type);
+                    state.data.push({ ...c, cloudId: d.id });
+                });
+                window.renderConfigs(); window.refreshTable();
+            } catch (e) { console.error("Fetch Cloud Error:", e); }
+        }
+
+        async function syncToCloud(caseData, cId = null) {
+            const statusIcon = document.getElementById('syncStatus');
+            if(statusIcon) statusIcon.innerText = "● Syncing...";
+            try {
+                if (cId) await updateDoc(doc(db, "cases", cId), caseData);
+                else await addDoc(collection(db, "cases"), caseData);
+                statusIcon.innerText = "● Synchronized";
+                fetchFromCloud();
+            } catch (e) { alert("Sync Error"); }
+        }
+
+        // --- 🚀 Export ทุกฟังก์ชันให้ Global เรียกใช้ได้ ---
+        window.handleLogin = async () => {
+            const email = document.getElementById('loginEmail').value;
+            const pass = document.getElementById('loginPass').value;
+            try { await signInWithEmailAndPassword(auth, email, pass); }
+            catch (e) { alert("Login Failed: โปรดตรวจสอบ User/Pass"); }
+        };
+        window.logout = () => signOut(auth);
+        window.renderConfigs = () => {
+            const fill = (id, list, all = false) => {
+                const el = document.getElementById(id);
+                if(el) el.innerHTML = (all ? '<option value="">All</option>' : '') + list.map(v => `<option value="${v}">${v}</option>`).join('');
+            };
+            fill('partner', state.config.partners); fill('device', state.config.devices);
+            fill('billing', state.config.billing); fill('product', state.config.products);
+            fill('status', state.config.statuses);
+            fill('f_partner', state.config.partners, true); fill('f_device', state.config.devices, true);
+            fill('f_billing', state.config.billing, true); fill('f_product', state.config.products, true);
+            const dl = document.getElementById('caseTypeList');
+            if(dl) dl.innerHTML = state.config.caseTypes.map(t => `<option value="${t}">`).join('');
+        };
+        window.refreshTable = () => {
+            const q = (document.getElementById('searchInput')?.value || "").toLowerCase();
+            const fY = document.getElementById('f_year')?.value || "", fM = document.getElementById('f_month')?.value || "";
+            const fP = document.getElementById('f_partner')?.value || "", fD = document.getElementById('f_device')?.value || "";
+            const fB = document.getElementById('f_billing')?.value || "", fPr = document.getElementById('f_product')?.value || "";
+            filteredData = state.data.filter(i => {
+                const mD = (!fY || i.date.startsWith(fY)) && (!fM || i.date.includes(`-${fM}-`));
+                const mF = (!fP || i.partner === fP) && (!fD || i.device === fD) && (!fB || i.billing === fB) && (!fPr || i.product === fPr);
+                const mT = !q || (i.userId && i.userId.toString().includes(q)) || (i.problem && i.problem.toLowerCase().includes(q)) || (i.type && i.type.toLowerCase().includes(q));
+                return mD && mF && mT;
+            });
+            filteredData.sort((a,b) => new Date(b.date) - new Date(a.date));
+            renderTable();
+        };
+        function renderTable() {
+            const tb = document.getElementById('caseTable');
+            if(!tb) return;
+            const pageD = filteredData.slice((currentPage - 1) * ROWS_PER_PAGE, currentPage * ROWS_PER_PAGE);
+            document.getElementById('caseCount').innerText = filteredData.length;
+            document.getElementById('pageInfo').innerText = `PAGE ${currentPage} / ${Math.ceil(filteredData.length / ROWS_PER_PAGE) || 1}`;
+            tb.innerHTML = pageD.map(c => `
+                <tr class="hover:bg-slate-50 border-b group transition text-[10px] font-bold">
+                    <td class="p-3 font-mono text-slate-400 italic">${c.date}</td>
+                    <td class="p-3 font-black text-indigo-700 uppercase">${c.userId || '-'}</td>
+                    <td class="p-3 text-center"><b>${c.partner}</b><br><small class="text-slate-400 font-normal">${c.device}</small></td>
+                    <td class="p-3 text-center"><b>${c.billing || '-'}</b><br><small class="italic text-indigo-400 font-normal">${c.product || '-'}</small></td>
+                    <td class="p-3 leading-tight whitespace-pre-wrap"><div>${c.type}</div><div class="font-normal text-slate-500">${c.problem}</div></td>
+                    <td class="p-3 italic text-indigo-500 border-l border-indigo-50 bg-indigo-50/10 font-bold">${c.resolution || '-'}</td>
+                    <td class="p-3 text-center"><span class="px-2 py-1 rounded-lg text-[8px] font-black border uppercase ${c.status === 'Resolve Success' ? 'text-green-600 bg-green-50' : 'text-orange-600 bg-orange-50'}">${c.status}</span></td>
+                    <td class="p-3 text-center opacity-0 group-hover:opacity-100 transition whitespace-nowrap"><button onclick="editCase('${c.cloudId}')" class="text-indigo-600 font-black mr-2 uppercase">Edit</button><button onclick="deleteCase('${c.cloudId}')" class="text-red-400 font-black uppercase">Del</button></td>
+                </tr>
+            `).join('');
+        }
+        window.handleFormSubmit = async () => {
+            let typeV = document.getElementById('caseType').value.trim();
+            if (!typeV || !document.getElementById('problem').value) return alert("ระบุประเภทเคสและปัญหาด้วยครับ");
+            typeV = standardizeType(typeV);
+            const vals = { date: document.getElementById('caseDate').value, userId: document.getElementById('userId').value, partner: document.getElementById('partner').value, device: document.getElementById('device').value, billing: document.getElementById('billing').value, product: document.getElementById('product').value, type: typeV, problem: document.getElementById('problem').value, resolution: document.getElementById('resolution').value, status: document.getElementById('status').value, lastUpdated: Date.now() };
+            if (typeV.includes(':') && !state.config.caseTypes.includes(typeV)) { 
+                state.config.caseTypes.push(typeV); state.config.caseTypes.sort(); 
+                await setDoc(doc(db, "settings", "config"), { caseTypes: state.config.caseTypes });
+            }
+            await syncToCloud(vals, editingId);
+            window.cancelEdit();
+        };
+        window.editCase = (cId) => {
+            const i = state.data.find(c => c.cloudId === cId);
+            editingId = cId; document.getElementById('formTitle').innerText = "📝 EDITING CASE";
+            ['caseDate','userId','partner','device','billing','product','caseType','problem','resolution','status'].forEach(f => {
+                const el = document.getElementById(f); if(el) el.value = (f === 'caseType' ? i.type : i[f]) || "";
+            });
+            document.getElementById('submitBtn').innerText = "UPDATE CLOUD";
+            document.getElementById('cancelBtn').classList.remove('hidden');
+        };
+        window.cancelEdit = () => { editingId = null; document.getElementById('formTitle').innerText = "➕ บันทึกเคส"; document.getElementById('submitBtn').innerText = "บันทึกลง Cloud"; document.getElementById('cancelBtn').classList.add('hidden'); ['userId','caseType','problem','resolution'].forEach(f => document.getElementById(f).value = ''); };
+        window.changePage = (s) => { currentPage += s; window.refreshTable(); };
+        window.generateReport = () => {
+            const s = document.getElementById('reportStart').value, e = document.getElementById('reportEnd').value;
+            if(!s || !e) return alert("ระบุวันที่");
+            reportData = state.data.filter(c => c.date >= s && c.date <= e);
+            if(reportData.length === 0) return alert("ไม่พบข้อมูล");
+            document.getElementById('exportReportBtn').classList.remove('hidden');
+            const res = reportData.filter(c => c.status === 'Resolve Success').length;
+            document.getElementById('reportSummary').innerHTML = `<div class="bg-indigo-500/20 p-6 rounded-2xl border border-indigo-400/30 text-center"><div class="text-[9px] font-black opacity-40 uppercase mb-1">Total Volume</div><div class="text-4xl font-black">${reportData.length}</div></div><div class="bg-green-500/20 p-6 rounded-2xl border border-green-400/30 text-green-400 text-center"><div class="text-[9px] font-black opacity-40 uppercase mb-1 text-white">Success</div><div class="text-4xl font-black">${res}</div></div><div class="bg-orange-500/20 p-6 rounded-2xl border border-orange-400/30 text-orange-400 text-center"><div class="text-[9px] font-black opacity-40 uppercase mb-1 text-white">Pending</div><div class="text-4xl font-black">${reportData.length - res}</div></div><div class="bg-white/5 p-6 rounded-2xl border border-white/10 text-center"><div class="text-[9px] font-black opacity-40 uppercase mb-1">Performance</div><div class="text-4xl font-black italic text-indigo-300">${((res/reportData.length)*100).toFixed(1)}%</div></div>`;
+            const rowL = [...new Set(reportData.map(d => d.type))].sort();
+            const colL = [...new Set(reportData.map(d => d.partner))].sort();
+            let phtml = `<thead><tr class="border-b border-white/10 opacity-30 text-xs"><th class="p-4 text-left italic">Category Hierarchy</th>`;
+            colL.forEach(col => phtml += `<th class="p-4 text-center font-black">${col}</th>`);
+            phtml += `<th class="p-4 text-center bg-white/5 font-black text-indigo-400">TOTAL</th></tr></thead><tbody>`;
+            rowL.forEach(row => {
+                let rT = 0; phtml += `<tr class="border-b border-white/5 hover:bg-white/10 transition font-bold text-sm"><td class="p-4 text-slate-300 font-normal">${row}</td>`;
+                colL.forEach(col => { const c = reportData.filter(d => d.type === row && d.partner === col).length; phtml += `<td class="p-4 text-center text-xl ${c > 0 ? 'text-indigo-400' : 'opacity-10'}">${c || ''}</td>`; rT += c; });
+                phtml += `<td class="p-4 text-center bg-white/5 font-black text-indigo-300 text-xl">${rT}</td></tr>`;
+            });
+            document.getElementById('pivotTable').innerHTML = phtml + `</tbody>`;
+            const gen = (f, id) => {
+                const counts = reportData.reduce((a, c) => { const k = c[f] || 'ไม่ระบุ'; a[k] = (a[k] || 0) + 1; return a; }, {});
+                document.getElementById(id).innerHTML = Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<div class="flex justify-between items-center py-4 border-b border-white/5 font-bold uppercase"><span class="text-xs text-slate-400 tracking-wider">${k}</span><span class="text-3xl text-white font-black">${v} <span class="text-[10px] opacity-20 ml-1 font-normal italic font-mono uppercase">Cases</span></span></div>`).join('');
+            };
+            gen('partner', 'partnerSum'); gen('device', 'deviceSum'); gen('billing', 'billingSum'); gen('product', 'productSum');
+            updateChart();
+        };
+        function updateChart() {
+            const ctx = document.getElementById('partnerChart').getContext('2d');
+            const counts = reportData.reduce((acc, c) => { const k = c.partner || 'ไม่ระบุ'; acc[k] = (acc[k] || 0) + 1; return acc; }, {});
+            if(chartInstance) chartInstance.destroy();
+            chartInstance = new Chart(ctx, { type: 'pie', data: { labels: Object.keys(counts), datasets: [{ data: Object.values(counts), backgroundColor: ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { color: '#fff', font: { size: 12 } } }, datalabels: { color: '#fff', font: { weight: 'bold', size: 16 }, formatter: v => v } } } });
+        }
+        window.exportToBossTemplate = () => {
+            const wb = XLSX.utils.book_new();
+            const reportContent = [["Technical Support"], ["Monthly Report"], [], ["#", "UserId", "Type", "Channel", "Billing", "Product", "Device", "Date", "Problem", "Status", "Resolution"]];
+            reportData.forEach((r, idx) => reportContent.push([idx+1, r.userId, r.type, r.partner, r.billing, r.product, r.device, r.date, r.problem, r.status, r.resolution]));
+            XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(reportContent), "REPORT");
+            XLSX.writeFile(wb, `Report_Tier2_${new Date().toISOString().split('T')[0]}.xlsx`);
+        };
+        window.mergeLegacyJSON = async (event) => {
+            const fs = event.target.files; if (!fs.length) return;
+            let caseCount = 0;
+            for (let f of fs) {
+                const j = JSON.parse(await f.text());
+                if (j.config && j.config.caseTypes) {
+                    const valid = j.config.caseTypes.filter(t => t.includes(':')).map(t => standardizeType(t));
+                    state.config.caseTypes = [...new Set([...state.config.caseTypes, ...valid])].sort();
+                    await setDoc(doc(db, "settings", "config"), { caseTypes: state.config.caseTypes });
+                }
+                if (j.data && j.data.length > 0) {
+                    for(let c of j.data) {
+                        const isDup = state.data.some(d => d.date === c.date && d.userId === c.userId && d.problem === c.problem);
+                        if(!isDup) { if(c.type) c.type = standardizeType(c.type); await addDoc(collection(db, "cases"), c); caseCount++; }
+                    }
+                }
+            }
+            alert(`สำเร็จ! นำเข้าข้อมูลใหม่ ${caseCount} เคสเรียบร้อย`);
+            fetchFromCloud();
+        };
+        window.downloadJSON = () => {
+            const exportData = { config: { caseTypes: state.config.caseTypes }, data: state.data.map(({cloudId, ...rest}) => rest) };
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = `Tier2_Backup_${new Date().toISOString().split('T')[0]}.json`;
+            a.click();
+        };
+        window.deleteCase = async (cId) => { if(confirm('ลบจาก Cloud?')) { await deleteDoc(doc(db, "cases", cId)); fetchFromCloud(); } };
+
+        onAuthStateChanged(auth, (user) => {
+            const lp = document.getElementById('loginPage');
+            const ma = document.getElementById('mainApp');
+            if (user) { lp.style.display = 'none'; ma.style.display = 'flex'; fetchFromCloud(); }
+            else { lp.style.display = 'flex'; ma.style.display = 'none'; }
+        });
+    </script>
+
+    <style>
+        body { height: 100vh; overflow: hidden; background: #f8fafc; font-size: 14px; }
+        #mainApp { height: 100vh; display: flex; flex-direction: column; }
+        .content-area { flex: 1; display: flex; overflow: hidden; }
+        .sidebar { width: 320px; flex-shrink: 0; display: flex; flex-direction: column; background: white; border-right: 1px solid #e2e8f0; }
+        .sidebar-content { flex: 1; overflow-y: auto; padding: 1.5rem; }
+        .main-view { flex: 1; overflow-y: auto; background: #f8fafc; padding: 2rem; }
+        th { font-size: 9px !important; padding: 0.8rem 0.5rem !important; background: #f1f5f9; color: #64748b; font-weight: 900; text-transform: uppercase; }
+        td { font-size: 10px !important; padding: 0.6rem 0.5rem !important; vertical-align: top; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body>
+
+    <div id="loginPage" class="fixed inset-0 bg-indigo-950 z-[100] flex items-center justify-center p-6" style="display: flex;">
+        <div class="bg-white p-12 rounded-[3rem] shadow-2xl w-full max-w-md text-center border-t-8 border-indigo-400">
+            <h1 class="text-4xl font-black text-indigo-900 mb-2 italic tracking-tighter uppercase">🚀 TIER2</h1>
+            <p class="text-slate-400 font-bold uppercase tracking-widest text-[9px] mb-8">Cloud Management Access</p>
+            <input type="email" id="loginEmail" placeholder="Email" class="w-full border-2 border-slate-100 p-4 rounded-2xl mb-4 font-bold outline-none shadow-inner">
+            <input type="password" id="loginPass" placeholder="Password" class="w-full border-2 border-slate-100 p-4 rounded-2xl mb-6 font-bold outline-none shadow-inner">
+            <button onclick="handleLogin()" class="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black hover:bg-indigo-700 shadow-xl tracking-widest active:scale-95 transition uppercase">Login to Cloud</button>
+        </div>
+    </div>
+
+    <div id="mainApp" style="display: none;">
+        <header class="bg-white p-4 border-b w-full flex justify-between items-center px-8 shadow-sm">
+            <div class="flex items-center gap-4"><h1 class="text-xl font-black text-indigo-900 italic uppercase">🚀 Tier2 v.6.5</h1><span id="syncStatus" class="text-[9px] text-green-500 font-black uppercase tracking-widest bg-green-50 px-2 py-1 rounded-full border">● Synchronized</span></div>
+            <div class="flex gap-4 items-center">
+                <button onclick="downloadJSON()" class="text-[10px] font-black text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-xl uppercase shadow-sm">💾 Backup JSON</button>
+                <button onclick="document.getElementById('mergeInput').click()" class="text-[10px] font-black text-slate-400 hover:text-indigo-600 uppercase italic underline tracking-tight">🌀 Merge Files</button>
+                <input type="file" id="mergeInput" class="hidden" multiple onchange="mergeLegacyJSON(event)">
+                <button onclick="logout()" class="text-[10px] font-black text-red-400 uppercase italic">Sign Out</button>
+            </div>
+        </header>
+
+        <div class="content-area">
+            <div class="sidebar shadow-xl">
+                <div class="sidebar-content">
+                    <h2 id="formTitle" class="text-xs font-black text-slate-400 mb-6 uppercase tracking-widest border-b pb-2 italic">➕ บันทึกเคส</h2>
+                    <div class="space-y-4 font-bold">
+                        <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">Date</label><input type="date" id="caseDate" class="w-full border border-slate-200 p-2 rounded-xl text-sm outline-none bg-slate-50 focus:bg-white transition-all"></div>
+                        <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">User ID</label><input type="text" id="userId" class="w-full border border-slate-200 p-2 rounded-xl text-sm outline-none bg-slate-50 focus:bg-white transition-all" placeholder="Public ID..."></div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">Channel</label><select id="partner" class="w-full border border-slate-200 p-2 rounded-xl text-[11px] outline-none"></select></div>
+                            <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">Device</label><select id="device" class="w-full border border-slate-200 p-2 rounded-xl text-[11px] outline-none"></select></div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">Billing</label><select id="billing" class="w-full border border-slate-200 p-2 rounded-xl text-[11px] outline-none"></select></div>
+                            <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">Package</label><select id="product" class="w-full border border-slate-200 p-2 rounded-xl text-[11px] outline-none"></select></div>
+                        </div>
+                        <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block tracking-tight">ประเภทเคส (Emoji : หมวด : ประเภท)</label><input list="caseTypeList" id="caseType" class="w-full border-2 border-indigo-50 bg-indigo-50/50 p-2 rounded-xl text-[11px] text-indigo-700 outline-none" placeholder="ค้นหาหมวดหมู่..."><datalist id="caseTypeList"></datalist></div>
+                        <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block font-black">ปัญหา/รายละเอียด</label><textarea id="problem" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none" rows="3"></textarea></div>
+                        <div><label class="text-[9px] font-black text-indigo-500 uppercase mb-1 block italic underline">Resolution</label><textarea id="resolution" class="w-full border-2 border-indigo-50 p-2 rounded-xl text-xs font-bold outline-none shadow-sm" rows="2"></textarea></div>
+                        <div><label class="text-[9px] font-bold text-slate-400 uppercase mb-1 block">สถานะ</label><select id="status" class="w-full border border-slate-200 p-2 rounded-xl text-[11px] font-black uppercase text-indigo-600 outline-none"></select></div>
+                        <div class="pt-4">
+                            <button id="submitBtn" onclick="handleFormSubmit()" class="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black shadow-lg uppercase tracking-widest active:scale-95 transition">บันทึกลง Cloud</button>
+                            <button id="cancelBtn" onclick="cancelEdit()" class="hidden w-full bg-slate-300 text-slate-600 py-2 rounded-xl font-bold uppercase text-[10px] mt-2">Cancel Edit</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="main-view">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-xl font-black text-slate-700 uppercase italic tracking-tighter">📋 Database Logs <span id="caseCount" class="ml-2 text-[10px] bg-indigo-100 text-indigo-600 px-3 py-1 rounded-full font-bold">0</span></h2>
+                    <input type="text" id="searchInput" onkeyup="refreshTable()" placeholder="Search logs..." class="w-80 border border-slate-200 p-2 pl-10 rounded-xl text-sm font-bold shadow-sm outline-none focus:border-indigo-400 font-black">
+                </div>
+
+                <div class="grid grid-cols-6 gap-3 mb-6 bg-white p-3 rounded-2xl shadow-sm border border-slate-100 font-bold">
+                    <div><label class="text-[8px] font-black text-slate-400 uppercase block mb-1 text-center">Year</label><select id="f_year" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner"><option value="">All Years</option><option value="2025">2025</option><option value="2026">2026</option></select></div>
+                    <div><label class="text-[8px] font-black text-slate-400 uppercase block mb-1 text-center">Month</label><select id="f_month" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner"><option value="">All Months</option><option value="01">Jan</option><option value="02">Feb</option><option value="03">Mar</option><option value="04">Apr</option><option value="05">May</option><option value="06">Jun</option><option value="07">Jul</option><option value="08">Aug</option><option value="09">Sep</option><option value="10">Oct</option><option value="11">Nov</option><option value="12">Dec</option></select></div>
+                    <div><label class="text-[8px] font-black text-indigo-400 uppercase block mb-1 text-center font-black">Channel</label><select id="f_partner" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner italic"></select></div>
+                    <div><label class="text-[8px] font-black text-indigo-400 uppercase block mb-1 text-center font-black">Device</label><select id="f_device" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner italic"></select></div>
+                    <div><label class="text-[8px] font-black text-indigo-400 uppercase block mb-1 text-center font-black">Billing</label><select id="f_billing" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner italic"></select></div>
+                    <div><label class="text-[8px] font-black text-indigo-400 uppercase block mb-1 text-center font-black">Package</label><select id="f_product" onchange="refreshTable()" class="w-full bg-slate-50 p-1.5 rounded-lg text-[10px] font-black outline-none border-0 shadow-inner italic"></select></div>
+                </div>
+
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mb-10">
+                    <table class="w-full text-left border-collapse font-bold">
+                        <thead>
+                            <tr><th class="p-3"># Date</th><th class="p-3">User</th><th class="p-3 text-center">Source</th><th class="p-3 text-center">Billing/Pack</th><th class="p-3 w-1/4">Issue Category</th><th class="p-3 w-1/4 border-l">Resolution</th><th class="p-3 text-center">Status</th><th class="p-3 text-center">Action</th></tr>
+                        </thead>
+                        <tbody id="caseTable" class="divide-y divide-slate-50"></tbody>
+                    </table>
+                    <div class="p-3 flex justify-between items-center text-[10px] font-bold text-slate-400 border-t bg-slate-50/50 uppercase font-mono tracking-tighter">
+                        <span id="pageInfo">PAGE 1 / 1</span>
+                        <div class="flex gap-2"><button onclick="changePage(-1)" class="px-4 py-1.5 border border-slate-200 rounded-lg hover:bg-white transition shadow-sm">PREV</button><button onclick="changePage(1)" class="px-4 py-1.5 border border-slate-200 rounded-lg hover:bg-white transition shadow-sm">NEXT</button></div>
+                    </div>
+                </div>
+
+                <div class="bg-indigo-950 p-10 rounded-[3rem] shadow-2xl text-white">
+                    <div class="flex justify-between items-end mb-12 border-b border-white/10 pb-8">
+                        <div><h2 class="text-3xl font-black italic uppercase tracking-tighter italic tracking-tight">📊 Executive Management Analyze</h2></div>
+                        <div class="flex gap-2 items-end">
+                            <div class="flex gap-2 bg-white/5 p-2.5 rounded-2xl border border-white/10 font-bold">
+                                <div><label class="text-[8px] opacity-40 block mb-1">START</label><input type="date" id="reportStart" class="bg-transparent border-b border-indigo-400 text-[11px] font-bold outline-none"></div>
+                                <div><label class="text-[8px] opacity-40 block mb-1">END</label><input type="date" id="reportEnd" class="bg-transparent border-b border-indigo-400 text-[11px] font-bold outline-none"></div>
+                            </div>
+                            <button onclick="generateReport()" class="bg-indigo-500 px-8 py-3 rounded-2xl font-black text-[10px] uppercase shadow-xl hover:bg-indigo-400 transition active:scale-95 tracking-widest italic">Run Analyze</button>
+                            <button id="exportReportBtn" onclick="exportToBossTemplate()" class="hidden bg-green-600 px-6 py-3 rounded-2xl font-black text-[10px] uppercase shadow-xl animate-pulse">📥 Export</button>
+                        </div>
+                    </div>
+                    <div id="reportSummary" class="grid grid-cols-4 gap-6 mb-12 font-black"></div>
+                    <div class="grid grid-cols-3 gap-10 font-bold">
+                        <div class="col-span-1 bg-white/5 p-8 rounded-[2rem] border border-white/10 h-[450px] relative shadow-xl"><canvas id="partnerChart"></canvas></div>
+                        <div class="col-span-2 bg-white/5 p-8 rounded-[2rem] border border-white/10 shadow-xl overflow-hidden"><table class="w-full text-left border-collapse font-bold" id="pivotTable"></table></div>
+                    </div>
+                    <div class="grid grid-cols-4 gap-6 mt-12 font-bold text-white tracking-tight">
+                        <div class="bg-indigo-900/40 p-6 rounded-[2rem] border border-white/5 shadow-2xl"><h3 class="text-[8px] opacity-40 uppercase tracking-[0.2em] mb-4 text-indigo-400">Channels</h3><div id="partnerSum" class="space-y-1"></div></div>
+                        <div class="bg-indigo-900/40 p-6 rounded-[2rem] border border-white/5 shadow-2xl"><h3 class="text-[8px] opacity-40 uppercase tracking-[0.2em] mb-4 text-indigo-400">Devices</h3><div id="deviceSum" class="space-y-1"></div></div>
+                        <div class="bg-indigo-900/40 p-6 rounded-[2rem] border border-white/5 shadow-2xl"><h3 class="text-[8px] opacity-40 uppercase tracking-[0.2em] mb-4 text-indigo-400">Billing</h3><div id="billingSum" class="space-y-1"></div></div>
+                        <div class="bg-indigo-900/40 p-6 rounded-[2rem] border border-white/5 shadow-2xl"><h3 class="text-[8px] opacity-40 uppercase tracking-[0.2em] mb-4 text-indigo-400">Packages</h3><div id="productSum" class="space-y-1"></div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
